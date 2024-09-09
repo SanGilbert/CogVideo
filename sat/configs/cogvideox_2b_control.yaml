@@ -1,6 +1,19 @@
 model:
   scale_factor: 1.15258426
   disable_first_stage_autocast: true
+  not_trainable_prefixes: []
+  mask_ratios: 
+    random: 0.05  
+    intepolate: 0.005  
+    quarter_random: 0.005  
+    quarter_head: 0.005  
+    quarter_tail: 0.005  
+    quarter_head_tail: 0.005  
+    image_random: 0.025  
+    image_head: 0.05  
+    image_tail: 0.025  
+    image_head_tail: 0.025  
+
   log_keys:
     - txt
 
@@ -24,7 +37,7 @@ model:
     params:
       time_embed_dim: 512
       elementwise_affine: True
-      num_frames: 52
+      num_frames: 24
       time_compressed_rate: 4
       latent_width: 150
       latent_height: 56
@@ -70,6 +83,30 @@ model:
     target: sgm.modules.GeneralConditioner
     params:
       emb_models:
+        - is_trainable: true
+          input_key: hint
+          ucg_rate: 0.1
+          target: sgm.modules.encoders.modules.Video3DEmbedder
+          params:
+              emb_dim: 16
+              in_channel: 19
+        # - is_trainable: true
+        #   input_key: hint
+        #   ucg_rate: 0.1
+        #   target: sgm.modules.encoders.modules.ContextParallelEncoder3DEmbedder
+        #   params:
+        #     double_z: false
+        #     z_channels: 16
+        #     resolution: 256  # no use
+        #     in_channels: 19
+        #     out_ch: 3  # no use
+        #     ch: 128
+        #     ch_mult: [ 1, 2, 2, 4 ]
+        #     attn_resolutions: [ ]
+        #     num_res_blocks: 3
+        #     dropout: 0.0
+        #     gather_norm: True
+        #     from_pretrained: "/data/proj/gengyu/CogVideo/sat/model_cache/CogVideoX-2b-sat/vae/3d-vae.pt"
         - is_trainable: false
           input_key: txt
           ucg_rate: 0.1
@@ -134,6 +171,8 @@ model:
             target: sgm.modules.diffusionmodules.discretizer.ZeroSNRDDPMDiscretization
             params:
               shift_scale: 3.0
+      use_additional_loss: True
+      additional_loss_weight: 0.1
 
   sampler_config:
     target: sgm.modules.diffusionmodules.sampling.VPSDEDPMPP2MSampler

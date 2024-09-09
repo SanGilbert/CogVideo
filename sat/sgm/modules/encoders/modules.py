@@ -15,6 +15,7 @@ from transformers import (
     T5Tokenizer,
 )
 
+from vae_modules.cp_enc_dec import ContextParallelEncoder3D, OpenSoraCausalConv3d
 from ...util import (
     append_dims,
     autocast,
@@ -23,6 +24,9 @@ from ...util import (
     disabled_train,
     expand_dims_like,
     instantiate_from_config,
+    set_grad_checkpoint,
+    auto_grad_checkpoint,
+    pad_at_dim
 )
 
 
@@ -32,6 +36,7 @@ class AbstractEmbModel(nn.Module):
         self._is_trainable = None
         self._ucg_rate = None
         self._input_key = None
+        self._grad_cp = None
 
     @property
     def is_trainable(self) -> bool:
@@ -44,6 +49,10 @@ class AbstractEmbModel(nn.Module):
     @property
     def input_key(self) -> str:
         return self._input_key
+    
+    @property
+    def grad_cp(self) -> bool:
+        return self._grad_cp
 
     @is_trainable.setter
     def is_trainable(self, value: bool):
@@ -57,6 +66,12 @@ class AbstractEmbModel(nn.Module):
     def input_key(self, value: str):
         self._input_key = value
 
+    @grad_cp.setter
+    def grad_cp(self, value: str):
+        self._grad_cp = value
+        if value == True:
+            set_grad_checkpoint(self)
+
     @is_trainable.deleter
     def is_trainable(self):
         del self._is_trainable
@@ -68,6 +83,10 @@ class AbstractEmbModel(nn.Module):
     @input_key.deleter
     def input_key(self):
         del self._input_key
+
+    @grad_cp.deleter
+    def grad_cp(self):
+        del self._grad_cp
 
 
 class GeneralConditioner(nn.Module):
@@ -82,6 +101,7 @@ class GeneralConditioner(nn.Module):
             assert isinstance(
                 embedder, AbstractEmbModel
             ), f"embedder model {embedder.__class__.__name__} has to inherit from AbstractEmbModel"
+            embedder.grad_cp = embconfig.get("grad_cp", False)
             embedder.is_trainable = embconfig.get("is_trainable", False)
             embedder.ucg_rate = embconfig.get("ucg_rate", 0.0)
             if not embedder.is_trainable:
@@ -146,9 +166,9 @@ class GeneralConditioner(nn.Module):
                         batch = self.possibly_get_ucg_val(embedder, batch)
                     else:
                         batch = self.surely_get_ucg_val(embedder, batch, cond_or_not)
-                emb_out = embedder(batch[embedder.input_key])
+                emb_out = auto_grad_checkpoint(embedder, batch[embedder.input_key])
             elif hasattr(embedder, "input_keys"):
-                emb_out = embedder(*[batch[k] for k in embedder.input_keys])
+                emb_out = auto_grad_checkpoint(embedder, *[batch[k] for k in embedder.input_keys])
         assert isinstance(
             emb_out, (torch.Tensor, list, tuple)
         ), f"encoder outputs must be tensors or a sequence, but got {type(emb_out)}"
@@ -243,7 +263,7 @@ class FrozenT5Embedder(AbstractEmbModel):
         cache_dir=None,
     ):
         super().__init__()
-        if model_dir is not "google/t5-v1_1-xxl":
+        if model_dir != "google/t5-v1_1-xxl":
             self.tokenizer = T5Tokenizer.from_pretrained(model_dir)
             self.transformer = T5EncoderModel.from_pretrained(model_dir)
         else:
@@ -279,3 +299,116 @@ class FrozenT5Embedder(AbstractEmbModel):
 
     def encode(self, text):
         return self(text)
+
+class ContextParallelEncoder3DEmbedder(ContextParallelEncoder3D, AbstractEmbModel):
+    def __init__(self, *args, from_pretrained=None, dtype="fp16", **kwargs):
+        super().__init__(*args, **kwargs)
+        if from_pretrained is not None:
+            self.init_from_ckpt(from_pretrained)
+        if dtype == "fp16":
+            self.dtype = torch.float16
+        elif dtype == "bf16":
+            self.dtype = torch.bfloat16
+        else:
+            self.dtype = torch.float32
+        set_grad_checkpoint(self)
+    
+    def init_from_ckpt(self, path, ignore_keys=list()):
+        sd = torch.load(path, map_location="cpu")["state_dict"]
+        target_key = "encoder"
+        keys = list(sd.keys())
+        # 挑选key
+        for k in keys:
+            if not k.startswith(target_key):
+                del sd[k]
+                continue
+            else:
+                cur_key = k.replace("encoder.", "")
+                sd[cur_key] = sd[k]
+                del sd[k]
+                k = cur_key
+
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+        model_state_dict = self.state_dict()
+        keys = list(sd.keys())
+        for k in keys:
+            shape_model = tuple(model_state_dict[k].shape)
+            shape_checkpoint = tuple(sd[k].shape)
+            if shape_model != shape_checkpoint:
+                print(
+                        "'{}' has shape {} in the checkpoint but {} in the "
+                        "model! Skipped.".format(k, shape_checkpoint, shape_model)
+                    )
+                del sd[k]
+        missing_keys, unexpected_keys = self.load_state_dict(sd, strict=False)
+        print("Missing keys: ", missing_keys)
+        print("Unexpected keys: ", unexpected_keys)
+        print(f"Restored from {path}")
+
+    def forward(self, x):
+        x = x.to(self.dtype)
+        return super().forward(x)
+    
+class Video3DEmbedder(AbstractEmbModel):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+
+    def __init__(self, emb_dim, hidden_size=[16, 32, 96, 256], in_channel=3, micro_frame_size=24, dtype="fp16"):
+        super().__init__()
+        if dtype == "fp16":
+            self.dtype = torch.float16
+        elif dtype == "bf16":
+            self.dtype = torch.bfloat16
+        else:
+            self.dtype = torch.float32
+        set_grad_checkpoint(self)
+        self.time_downsample_factor = 2 ** 2
+        self.micro_frame_size = micro_frame_size
+        self.condition_encoder = nn.Sequential(
+            OpenSoraCausalConv3d(in_channel, hidden_size[0], 3),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[0], hidden_size[1], 3),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[1], hidden_size[1], 3, strides=[1, 2, 2]),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[1], hidden_size[1], 3),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[1], hidden_size[1], 3, strides=[2, 1, 1]),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[1], hidden_size[2], 3),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[2], hidden_size[2], 3, strides=[1, 2, 2]),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[2], hidden_size[2], 3),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[2], hidden_size[2], 3, strides=[2, 1, 1]),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[2], hidden_size[3], 3),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[3], hidden_size[3], 3, strides=[1, 2, 2]),
+            nn.SiLU(),
+            OpenSoraCausalConv3d(hidden_size[3], emb_dim, 3)
+        )
+        for param in self.condition_encoder.parameters():
+            nn.init.zeros_(param)
+
+    def forward(self, video):
+        video = video.to(self.dtype)
+        z_list = []
+        for i in range(0, video.shape[2], self.micro_frame_size):
+            x_z_bs = video[:, :, i : i + self.micro_frame_size]
+
+            time_padding = (
+                0
+                if (x_z_bs.shape[2] % self.time_downsample_factor == 0)
+                else self.time_downsample_factor - x_z_bs.shape[2] % self.time_downsample_factor
+            )
+            x_z_bs = pad_at_dim(x_z_bs, (time_padding, 0), dim=2)
+            x_z_bs = self.condition_encoder(x_z_bs)
+            z_list.append(x_z_bs)
+        z = torch.cat(z_list, dim=2)
+        return z

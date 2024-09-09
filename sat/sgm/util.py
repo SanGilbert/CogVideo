@@ -10,6 +10,12 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from safetensors.torch import load_file as load_safetensors
 import torch.distributed
+from collections.abc import Iterable
+
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint, checkpoint_sequential
+from sat.helpers import print_rank0
 
 _CONTEXT_PARALLEL_GROUP = None
 _CONTEXT_PARALLEL_SIZE = None
@@ -359,6 +365,57 @@ def get_nested_attribute(obj, attribute_path, depth=None, return_key=False):
     return (current_attribute, current_key) if return_key else current_attribute
 
 
+
+def set_grad_checkpoint(model, gc_step=1):
+    assert isinstance(model, nn.Module)
+
+    def set_attr(module):
+        module.grad_checkpointing = True
+        module.grad_checkpointing_step = gc_step
+
+    model.apply(set_attr)
+
+
+def auto_grad_checkpoint(module, *args, **kwargs):
+    if getattr(module, "grad_checkpointing", False):
+        if not isinstance(module, Iterable):
+            return checkpoint(module, *args, use_reentrant=False, **kwargs)
+        gc_step = module[0].grad_checkpointing_step
+        return checkpoint_sequential(module, gc_step, *args, use_reentrant=False, **kwargs)
+    return module(*args, **kwargs)
+
+def pad_at_dim(t, pad, dim=-1):
+    dims_from_right = (-dim - 1) if dim < 0 else (t.ndim - dim - 1)
+    zeros = (0, 0) * dims_from_right
+    return F.pad(t, (*zeros, *pad), mode="constant")
+
+def get_model_numel(model: torch.nn.Module):
+    num_params = 0
+    num_params_trainable = 0
+    for p in model.parameters():
+        num_params += p.numel()
+        if p.requires_grad:
+            num_params_trainable += p.numel()
+    return num_params, num_params_trainable
+
+def format_numel_str(numel: int) -> str:
+    B = 1024**3
+    M = 1024**2
+    K = 1024
+    if numel >= B:
+        return f"{numel / B:.2f} B"
+    elif numel >= M:
+        return f"{numel / M:.2f} M"
+    elif numel >= K:
+        return f"{numel / K:.2f} K"
+    else:
+        return f"{numel}"
+    
+def count_model_param(model, name):
+    model_numel, model_numel_trainable = get_model_numel(model)
+    print_rank0(f"[{name}] Trainable model params: {format_numel_str(model_numel_trainable)}, \
+                Total model params: {format_numel_str(model_numel)},")
+    
 from math import sqrt
 
 

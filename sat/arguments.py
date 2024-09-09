@@ -265,8 +265,8 @@ def process_config_to_args(args):
             arg = OmegaConf.to_object(args_config[key])
         else:
             arg = args_config[key]
-        if hasattr(args, key):
-            setattr(args, key, arg)
+        # if hasattr(args, key):
+        setattr(args, key, arg)
 
     if "model" in config:
         model_config = config.pop("model", OmegaConf.create())

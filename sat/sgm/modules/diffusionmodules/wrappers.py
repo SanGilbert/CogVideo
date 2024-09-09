@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from packaging import version
+from .util import cross_norm
 
 OPENAIUNETWRAPPER = "sgm.modules.diffusionmodules.wrappers.OpenAIWrapper"
 
@@ -25,13 +26,17 @@ class OpenAIWrapper(IdentityWrapper):
         for key in c:
             c[key] = c[key].to(self.dtype)
 
-        if x.dim() == 4:
-            x = torch.cat((x, c.get("concat", torch.Tensor([]).type_as(x))), dim=1)
-        elif x.dim() == 5:
-            x = torch.cat((x, c.get("concat", torch.Tensor([]).type_as(x))), dim=2)
-        else:
-            raise ValueError("Input tensor must be 4D or 5D")
-
+        # use concat key to add, simplify training flow.
+        if "concat" in c.keys():
+            add_c = c["concat"].permute(0, 2, 1, 3, 4) # B, C, T, H, W -> B, T, C, H, W
+            assert add_c.shape[2] % x.shape[2] == 0
+            num_c = add_c.shape[2] // x.shape[2]
+            add_c = add_c.chunk(num_c, dim=2)
+            add_c = sum(add_c)
+            x = x + add_c
+            # controlnext
+            # x = cross_norm(x, add_c, scale=0.2)
+            
         return self.diffusion_model(
             x,
             timesteps=t,

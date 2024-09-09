@@ -64,6 +64,8 @@ def generate_video(
     # for diffusers `0.30.1` and after version, this should be 49.
 
     video = pipe(
+        height=448,
+        width=1200,
         prompt=prompt,
         num_videos_per_prompt=num_videos_per_prompt,  # Number of videos to generate per prompt
         num_inference_steps=num_inference_steps,  # Number of inference steps

@@ -2,7 +2,6 @@ import math
 from contextlib import contextmanager
 from typing import Any, Dict, List, Tuple, Union, Optional
 from omegaconf import ListConfig, OmegaConf
-from copy import deepcopy
 import torch.nn.functional as F
 
 from sat.helpers import print_rank0
@@ -18,10 +17,12 @@ from sgm.util import (
     get_obj_from_str,
     instantiate_from_config,
     log_txt_as_img,
+    count_model_param,
 )
+from sgm.modules.diffusionmodules.util import MaskGenerator
 import gc
 from sat import mpu
-import random
+
 
 
 class SATVideoDiffusionEngine(nn.Module):
@@ -72,16 +73,22 @@ class SATVideoDiffusionEngine(nn.Module):
         self.dtype_str = dtype_str
 
         network_config["params"]["dtype"] = dtype_str
+
+        if model_config.get("mask_ratios", None) is not None:
+            self.mask_generator = MaskGenerator(model_config["mask_ratios"])
         model = instantiate_from_config(network_config)
         self.model = get_obj_from_str(default(network_wrapper, OPENAIUNETWRAPPER))(
             model, compile_model=compile_model, dtype=dtype
         )
+        count_model_param(self.model, name="Diffusion Model")
 
         self.denoiser = instantiate_from_config(denoiser_config)
         self.sampler = instantiate_from_config(sampler_config) if sampler_config is not None else None
         self.conditioner = instantiate_from_config(default(conditioner_config, UNCONDITIONAL_CONFIG))
+        count_model_param(self.conditioner, name="Conditioner")
 
         self._init_first_stage(first_stage_config)
+        count_model_param(self.first_stage_model, name="VAE")
 
         self.loss_fn = instantiate_from_config(loss_fn_config) if loss_fn_config is not None else None
 
@@ -128,6 +135,9 @@ class SATVideoDiffusionEngine(nn.Module):
         self.first_stage_model = model
 
     def forward(self, x, batch):
+        if getattr(self, "mask_generator", None) is not None:
+            x_mask = self.mask_generator.get_masks(x)
+            batch["x_mask"] = x_mask # False for z, True for noise
         loss = self.loss_fn(self.model, self.denoiser, self.conditioner, x, batch)
         loss_mean = loss.mean()
         loss_dict = {"loss": loss_mean}
@@ -268,6 +278,7 @@ class SATVideoDiffusionEngine(nn.Module):
         N: int = 8,
         ucg_keys: List[str] = None,
         only_log_video_latents=False,
+        cond_key = None,
         **kwargs,
     ) -> Dict:
         conditioner_input_keys = [e.input_key for e in self.conditioner.embedders]
@@ -293,6 +304,14 @@ class SATVideoDiffusionEngine(nn.Module):
         x = x.to(self.device)[:N]
         if not self.latent_input:
             log["inputs"] = x.to(torch.float32)
+        if cond_key is not None:
+            cond = batch[cond_key].to(self.device, torch.float32)
+            cond = cond.permute(0, 2, 1, 3, 4).contiguous()   # B T C H W
+            mask = (cond[:, :, 0:3] == 1) & (cond[:, :, 13:16] == 1) # overflow
+            cond[cond == 1] = 0
+            cond = cond[:, :, 0:3] + cond[:, :, 13:16] # obj + lane
+            cond[mask] = 1
+            log[cond_key] = cond 
         x = x.permute(0, 2, 1, 3, 4).contiguous()
         z = self.encode_first_stage(x, batch)
         if not only_log_video_latents:

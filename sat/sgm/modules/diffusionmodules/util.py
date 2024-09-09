@@ -14,8 +14,35 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.fft as fft  # differentiable
+import random
 from einops import rearrange, repeat
+from sat.helpers import print_rank0
 
+def fourier_filter(x, scale, d_s=0.25):
+    dtype = x.dtype
+    x = x.type(torch.float32)
+    # FFT
+    x_freq = fft.fftn(x, dim=(-2, -1))
+    x_freq = fft.fftshift(x_freq, dim=(-2, -1))
+
+    H, W = x_freq.shape[-2:]
+    mask = torch.ones_like(x_freq)
+
+    for h in range(H):
+        for w in range(W):
+            d_square = (2 * h / H - 1) ** 2 + (2 * w / W - 1) ** 2
+            if d_square <= 2 * d_s:
+                mask[..., h, w] = scale
+
+    x_freq = x_freq * mask
+
+    # IFFT
+    x_freq = fft.ifftshift(x_freq, dim=(-2, -1))
+    x_filtered = fft.ifftn(x_freq, dim=(-2, -1)).real
+
+    x_filtered = x_filtered.type(dtype)
+    return x_filtered
 
 def make_beta_schedule(
     schedule,
@@ -265,6 +292,15 @@ def linear(*args, **kwargs):
     return nn.Linear(*args, **kwargs)
 
 
+def cross_norm(latent: torch.Tensor, control: torch.Tensor, scale=0.4, dim=(-3,-2,-1)):
+    # controlnext
+    mean_latent, std_latent = torch.mean(latent, dim=dim, keepdim=True), torch.std(latent, dim=dim, keepdim=True)
+    mean_control, std_control = torch.mean(control, dim=dim, keepdim=True), torch.std(control, dim=dim, keepdim=True)
+    control = (control - mean_control) * (std_latent / (std_control + 1e-5)) + mean_latent
+    latent = latent * (1 - scale) + control * scale
+    return latent
+
+
 def avg_pool_nd(dims, *args, **kwargs):
     """
     Create a 1D, 2D, or 3D average pooling module.
@@ -326,3 +362,102 @@ class AlphaBlender(nn.Module):
         alpha = self.get_alpha(image_only_indicator)
         x = alpha.to(x_spatial.dtype) * x_spatial + (1.0 - alpha).to(x_spatial.dtype) * x_temporal
         return x
+
+class MaskGenerator:
+    def __init__(self, mask_ratios):
+        valid_mask_names = [
+            "identity",
+            "quarter_random",
+            "quarter_head",
+            "quarter_tail",
+            "quarter_head_tail",
+            "image_random",
+            "image_head",
+            "image_tail",
+            "image_head_tail",
+            "random",
+            "intepolate",
+        ]
+        assert all(
+            mask_name in valid_mask_names for mask_name in mask_ratios.keys()
+        ), f"mask_name should be one of {valid_mask_names}, got {mask_ratios.keys()}"
+        assert all(
+            mask_ratio >= 0 for mask_ratio in mask_ratios.values()
+        ), f"mask_ratio should be greater than or equal to 0, got {mask_ratios.values()}"
+        assert all(
+            mask_ratio <= 1 for mask_ratio in mask_ratios.values()
+        ), f"mask_ratio should be less than or equal to 1, got {mask_ratios.values()}"
+        # sum of mask_ratios should be 1
+        if "identity" not in mask_ratios:
+            mask_ratios["identity"] = 1.0 - sum(mask_ratios.values())
+        assert math.isclose(
+            sum(mask_ratios.values()), 1.0, abs_tol=1e-6
+        ), f"sum of mask_ratios should be 1, got {sum(mask_ratios.values())}"
+        print_rank0(f"mask ratios: {mask_ratios}")
+        self.mask_ratios = mask_ratios
+
+    def get_mask(self, x):
+        mask_type = random.random()
+        mask_name = None
+        prob_acc = 0.0
+        for mask, mask_ratio in self.mask_ratios.items():
+            prob_acc += mask_ratio
+            if mask_type < prob_acc:
+                mask_name = mask
+                break
+
+        num_frames = x.shape[1]
+        # Hardcoded condition_frames
+        condition_frames_max = num_frames // 4
+
+        mask = torch.ones(num_frames, dtype=torch.bool, device=x.device)
+        if num_frames <= 1:
+            return mask
+
+        if mask_name == "quarter_random":
+            random_size = random.randint(1, condition_frames_max)
+            random_pos = random.randint(0, x.shape[2] - random_size)
+            mask[random_pos : random_pos + random_size] = 0
+        elif mask_name == "image_random":
+            random_size = 1
+            random_pos = random.randint(0, x.shape[2] - random_size)
+            mask[random_pos : random_pos + random_size] = 0
+        elif mask_name == "quarter_head":
+            random_size = random.randint(1, condition_frames_max)
+            mask[:random_size] = 0
+        elif mask_name == "image_head":
+            random_size = 1
+            mask[:random_size] = 0
+        elif mask_name == "quarter_tail":
+            random_size = random.randint(1, condition_frames_max)
+            mask[-random_size:] = 0
+        elif mask_name == "image_tail":
+            random_size = 1
+            mask[-random_size:] = 0
+        elif mask_name == "quarter_head_tail":
+            random_size = random.randint(1, condition_frames_max)
+            mask[:random_size] = 0
+            mask[-random_size:] = 0
+        elif mask_name == "image_head_tail":
+            random_size = 1
+            mask[:random_size] = 0
+            mask[-random_size:] = 0
+        elif mask_name == "intepolate":
+            random_start = random.randint(0, 1)
+            mask[random_start::2] = 0
+        elif mask_name == "random":
+            mask_ratio = random.uniform(0.1, 0.9)
+            mask = torch.rand(num_frames, device=x.device) > mask_ratio
+            # if mask is all False, set the last frame to True
+            if not mask.any():
+                mask[-1] = 1
+
+        return mask
+
+    def get_masks(self, x):
+        masks = []
+        for _ in range(len(x)):
+            mask = self.get_mask(x)
+            masks.append(mask)
+        masks = torch.stack(masks, dim=0)
+        return masks

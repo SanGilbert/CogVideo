@@ -9,7 +9,7 @@ import math
 from ...modules.diffusionmodules.sampling import VideoDDIMSampler, VPSDEDPMPP2MSampler
 from ...util import append_dims, instantiate_from_config
 from ...modules.autoencoding.lpips.loss.lpips import LPIPS
-
+from .util import fourier_filter
 # import rearrange
 from einops import rearrange
 import random
@@ -71,11 +71,14 @@ class StandardDiffusionLoss(nn.Module):
 
 
 class VideoDiffusionLoss(StandardDiffusionLoss):
-    def __init__(self, block_scale=None, block_size=None, min_snr_value=None, fixed_frames=0, **kwargs):
+    def __init__(self, block_scale=None, block_size=None, min_snr_value=None, fixed_frames=0,
+                  use_additional_loss=False, additional_loss_weight=0.1, **kwargs):
         self.fixed_frames = fixed_frames
         self.block_scale = block_scale
         self.block_size = block_size
         self.min_snr_value = min_snr_value
+        self.use_additional_loss = use_additional_loss
+        self.additional_loss_weight = additional_loss_weight
         super().__init__(**kwargs)
 
     def __call__(self, network, denoiser, conditioner, input, batch):
@@ -106,17 +109,37 @@ class VideoDiffusionLoss(StandardDiffusionLoss):
         noised_input = input.float() * append_dims(alphas_cumprod_sqrt, input.ndim) + noise * append_dims(
             (1 - alphas_cumprod_sqrt**2) ** 0.5, input.ndim
         )
-
-        model_output = denoiser(network, noised_input, alphas_cumprod_sqrt, cond, **additional_model_inputs)
         w = append_dims(1 / (1 - alphas_cumprod_sqrt**2), input.ndim)  # v-pred
 
         if self.min_snr_value is not None:
             w = min(w, self.min_snr_value)
+        x_mask = batch.get("x_mask", None)
+        additional_model_inputs["x_mask"] = x_mask
+        if x_mask is not None:
+            x_mask = x_mask[:, :, None, None, None]
+            noised_input = torch.where(x_mask, noised_input, input)
+            w = w * x_mask
+        model_output = denoiser(network, noised_input, alphas_cumprod_sqrt, cond, **additional_model_inputs)
+
         return self.get_loss(model_output, input, w)
 
     def get_loss(self, model_output, target, w):
         if self.type == "l2":
-            return torch.mean((w * (model_output - target) ** 2).reshape(target.shape[0], -1), 1)
+            if self.use_additional_loss:
+                B, T, C, H, W = model_output.shape
+                aux_loss = ((target[:, 1:] - target[:, :-1]) - (model_output[:, 1:] - model_output[:, :-1])) ** 2
+                aux_loss = rearrange(aux_loss, "b t c h w -> b (t h w) c")
+                aux_w = F.normalize(aux_loss, p=2)
+                aux_w = rearrange(aux_w, "b (t h w) c -> b t c h w", t=T-1, h=H, w=W)
+                aux_w = 1 + torch.cat((torch.zeros(B, 1, *aux_w.shape[2:]).to(aux_w), aux_w), dim=1)
+                predict_hf = fourier_filter(model_output, scale=0.) # (b t) c h w
+                target_hf = fourier_filter(target, scale=0.)
+                hf_loss = torch.mean((w * (predict_hf - target_hf) ** 2).reshape(target.shape[0], -1), 1)
+                return torch.mean(
+                    ((w * (model_output - target) ** 2) * aux_w.detach()).reshape(target.shape[0], -1), 1
+                ) + self.additional_loss_weight * hf_loss
+            else:
+                return torch.mean((w * (model_output - target) ** 2).reshape(target.shape[0], -1), 1)
         elif self.type == "l1":
             return torch.mean((w * (model_output - target).abs()).reshape(target.shape[0], -1), 1)
         elif self.type == "lpips":

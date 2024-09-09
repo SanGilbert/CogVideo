@@ -7,9 +7,12 @@ import torch.distributed
 import torchvision
 from omegaconf import OmegaConf
 import imageio
-
+import glob
+import re
 import torch
-
+import torch.distributed as dist
+import shutil
+from loguru import logger
 from sat import mpu
 from sat.training.deepspeed_training import training_main
 
@@ -70,7 +73,7 @@ def log_video(batch, model, args, only_log_video_latents=False):
         "cache_enabled": torch.is_autocast_cache_enabled(),
     }
     with torch.no_grad(), torch.cuda.amp.autocast(**gpu_autocast_kwargs):
-        videos = model.log_video(batch, only_log_video_latents=only_log_video_latents)
+        videos = model.log_video(batch, only_log_video_latents=only_log_video_latents, cond_key="hint")
 
     if torch.distributed.get_rank() == 0:
         root = os.path.join(args.save, "video")
@@ -139,6 +142,23 @@ def broad_cast_batch(batch):
     torch.distributed.broadcast(batch["num_frames"], src=src, group=mpu.get_model_parallel_group())
     return batch
 
+def del_old_ckpt(args):
+    pattern = re.compile(r'^(\d+)(-ema)?$')      # == delete old checkpoint == #
+    exp_dir_list = os.listdir(args.save)
+    exp_dir_list = [dir_path for dir_path in exp_dir_list if re.match(pattern, dir_path)]
+    exp_dir_list.sort(key=lambda x: int(re.search(r'(\d+)', x).group(1)))
+    if len(exp_dir_list) > args.save_total_limit * 2: # ori + ema
+        checkpoint = os.path.join(args.save, exp_dir_list[0])
+        checkpoint_ema = os.path.join(args.save, exp_dir_list[1])
+        if dist.get_rank() == 0:
+            logger.info(f"Deleting older checkpoint {checkpoint} due to cfg.save_total_limit")
+            try:
+                shutil.rmtree(checkpoint, ignore_errors=True)
+                shutil.rmtree(checkpoint_ema, ignore_errors=True)
+                logger.success(f"{checkpoint}&_ema has been deleted successfully!")
+            except Exception as e:
+                logger.warning(
+                    f"Could not remove checkpoint {checkpoint}&_ema after going over the `save_total_limit`. Error is: {e}")
 
 def forward_step_eval(data_iterator, model, args, timers, only_log_video_latents=False, data_class=None):
     if mpu.get_model_parallel_rank() == 0:
@@ -162,6 +182,7 @@ def forward_step_eval(data_iterator, model, args, timers, only_log_video_latents
         batch_video = {"mp4": None, "fps": None, "num_frames": None, "txt": None}
     broad_cast_batch(batch_video)
     if mpu.get_data_parallel_rank() == 0:
+        del_old_ckpt(args)
         log_video(batch_video, model, args, only_log_video_latents=only_log_video_latents)
 
     batch_video["global_step"] = args.iteration

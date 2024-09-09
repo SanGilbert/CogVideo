@@ -1,36 +1,66 @@
 args:
   checkpoint_activations: True ## using gradient checkpointing
   model_parallel_size: 1
-  experiment_name: lora-disney
+  experiment_name: control
   mode: finetune
-  load: "cogvideox-2b-sat/transformer"
+  load: "/data/proj/gengyu/CogVideo/sat/ckpts/control-08-30-15-42/"
   no_load_rng: True
-  train_iters: 1000 # Suggest more than 1000 For Lora and SFT For 500 is enough
+  train_iters: 100000 # Suggest more than 1000 For Lora and SFT For 500 is enough
   eval_iters: 1
-  eval_interval: 100
+  eval_interval: 200
   eval_batch_size: 1
-  save: ckpts_2b_lora
-  save_interval: 500
+  save: ckpts
+  save_interval: 200
+  save_total_limit: 2 # how much epoch at most are saved (remove old ones)
   log_interval: 20
   train_data: [ "disney" ] # Train data path
   valid_data: [ "disney" ] # Validation data path, can be the same as train_data(not recommended)
   split: 1,0,0
   num_workers: 8
   force_train: True
-  only_log_video_latents: True
+  only_log_video_latents: False
+  wandb: true
+  wandb_project_name: Cogvideo-control
 
 data:
-  target: data_video.SFTDataset
+  target: datasets_control.nuscenes_data.control_nuscenes_advanced.ControlNuscenes
   params:
-    video_size: [ 480, 720 ]
-    fps: 8
-    max_num_frames: 49
-    skip_frms_num: 3.
+    resemble_size: [2, 3]
+    data_split: "training_advanced_12hz"
+    ida_aug_conf:
+        resize_lim: [0.25, 0.25]
+        final_dim: [224, 400]
+        rot_lim: [0, 0]
+        H: 900
+        W: 1600
+        rand_flip: false
+        bot_pct_lim: [0.0, 0.0]
+        cams: ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+        Ncams: 6
+    classes: [
+        "car",
+        "truck",
+        "construction_vehicle",
+        "bus",
+        "trailer",
+        "barrier",
+        "motorcycle",
+        "bicycle",
+        "pedestrian",
+        "traffic_cone"]
+    bda_aug_conf: 
+        rot_lim: [0, 0]
+        scale_lim: [1, 1] 
+        flip_dx_ratio: 0
+        flip_dy_ratio: 0
+    box_range: [-50, -50, -5, 50, 50, 5]
+    num_sweeps: 24
+    root_path: s3://generator/data/nuscenes/
 
 deepspeed:
   # Minimun for 16 videos per batch for ALL GPUs, This setting is for 8 x A100 GPUs
-  train_micro_batch_size_per_gpu: 2
-  gradient_accumulation_steps: 1
+  train_micro_batch_size_per_gpu: 1
+  gradient_accumulation_steps: 2
   steps_per_print: 50
   gradient_clipping: 0.1
   zero_optimization:
@@ -55,9 +85,9 @@ deepspeed:
   optimizer:
     type: sat.ops.FusedEmaAdam
     params:
-      lr: 0.001 # Between 1E-3 and 5E-4 For Lora and 1E-5 For SFT
+      lr: 1.0e-5 # Between 1E-3 and 5E-4 For Lora and 1E-5 For SFT
       betas: [ 0.9, 0.95 ]
-      eps: 1e-8
+      eps: 1e-6
       weight_decay: 1e-4
   activation_checkpointing:
     partition_activations: false

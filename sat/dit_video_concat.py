@@ -271,8 +271,8 @@ class Rotary3DPositionEmbeddingMixin(BaseMixin):
         freqs = freqs.contiguous()
         freqs_sin = freqs.sin()
         freqs_cos = freqs.cos()
-        self.register_buffer("freqs_sin", freqs_sin)
-        self.register_buffer("freqs_cos", freqs_cos)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
 
     def rotary(self, t, **kwargs):
         seq_len = t.shape[2]
@@ -336,6 +336,13 @@ def unpatchify(x, c, p, w, h, rope_position_ids=None, **kwargs):
 
     return imgs
 
+def mask_select(x, x_t0, mask, T, S):
+    # only consider img. Cause text is unseperatable and not important in this work.
+    x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
+    x_t0 = rearrange(x_t0, "B (T S) C -> B T S C", T=T, S=S)
+    x = torch.where(mask[:, :, None, None], x, x_t0)
+    x = rearrange(x, "B T S C -> B (T S) C")
+    return x
 
 class FinalLayerMixin(BaseMixin):
     def __init__(
@@ -362,13 +369,21 @@ class FinalLayerMixin(BaseMixin):
 
     def final_forward(self, logits, **kwargs):
         x, emb = logits[:, kwargs["text_length"] :, :], kwargs["emb"]  # x:(b,(t n),d)
-
+        x_mask = kwargs.get("x_mask", None)
+        T, H, W = kwargs.get("latent_shape", [0,0,0])
+        S = H * W
         shift, scale = self.adaLN_modulation(emb).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
+        x_out = modulate(self.norm_final(x), shift, scale)
+        x_out = self.linear(x_out)
+        if x_mask is not None:
+            emb_t0 = kwargs["emb_t0"]
+            shift_t0, scale_t0 = self.adaLN_modulation(emb_t0).chunk(2, dim=1)
+            x_out_t0 = modulate(self.norm_final(x), shift_t0, scale_t0)
+            x_out_t0 = self.linear(x_out_t0)
+            x_out = mask_select(x_out, x_out_t0, x_mask, T, S)
 
         return unpatchify(
-            x,
+            x_out,
             c=self.out_channels,
             p=self.patch_size,
             w=self.latent_width // self.patch_size,
@@ -461,6 +476,9 @@ class AdaLNMixin(BaseMixin):
         layer = self.transformer.layers[kwargs["layer_id"]]
         adaLN_modulation = self.adaLN_modulations[kwargs["layer_id"]]
 
+        x_mask = kwargs.get("x_mask", None)
+        T, H, W = kwargs.get("latent_shape", [0,0,0])
+        S = H * W
         (
             shift_msa,
             scale_msa,
@@ -482,13 +500,40 @@ class AdaLNMixin(BaseMixin):
             text_gate_mlp.unsqueeze(1),
         )
 
+        if x_mask is not None:
+            (
+                shift_msa_t0,
+                scale_msa_t0,
+                gate_msa_t0,
+                shift_mlp_t0,
+                scale_mlp_t0,
+                gate_mlp_t0,
+                text_shift_msa_t0,
+                text_scale_msa_t0,
+                text_gate_msa_t0,
+                text_shift_mlp_t0,
+                text_scale_mlp_t0,
+                text_gate_mlp_t0,
+            ) = adaLN_modulation(kwargs["emb_t0"]).chunk(12, dim=1)
+            gate_msa_t0, gate_mlp_t0, text_gate_msa_t0, text_gate_mlp_t0 = (
+                gate_msa_t0.unsqueeze(1),
+                gate_mlp_t0.unsqueeze(1),
+                text_gate_msa_t0.unsqueeze(1),
+                text_gate_mlp_t0.unsqueeze(1),
+            )
+
         # self full attention (b,(t n),d)
         img_attention_input = layer.input_layernorm(img_hidden_states)
         text_attention_input = layer.input_layernorm(text_hidden_states)
-        img_attention_input = modulate(img_attention_input, shift_msa, scale_msa)
-        text_attention_input = modulate(text_attention_input, text_shift_msa, text_scale_msa)
+        img_attention_input_ = modulate(img_attention_input, shift_msa, scale_msa)
+        if x_mask is not None:
+            img_attention_input_t0 = modulate(img_attention_input, shift_msa_t0, scale_msa_t0)
+            img_attention_input_ = mask_select(img_attention_input_, img_attention_input_t0, x_mask, T=T, S=S)
 
-        attention_input = torch.cat((text_attention_input, img_attention_input), dim=1)  # (b,n_t+t*n_i,d)
+        text_attention_input_ = modulate(text_attention_input, text_shift_msa, text_scale_msa)
+
+        attention_input = torch.cat((text_attention_input_, img_attention_input_), dim=1)  # (b,n_t+t*n_i,d)
+
         attention_output = layer.attention(attention_input, mask, **kwargs)
         text_attention_output = attention_output[:, :text_length]  # (b,n,d)
         img_attention_output = attention_output[:, text_length:]  # (b,(t n),d)
@@ -496,15 +541,26 @@ class AdaLNMixin(BaseMixin):
         if self.transformer.layernorm_order == "sandwich":
             text_attention_output = layer.third_layernorm(text_attention_output)
             img_attention_output = layer.third_layernorm(img_attention_output)
-        img_hidden_states = img_hidden_states + gate_msa * img_attention_output  # (b,(t n),d)
-        text_hidden_states = text_hidden_states + text_gate_msa * text_attention_output  # (b,n,d)
+        img_hidden_states_mid = img_hidden_states + gate_msa * img_attention_output  # (b,(t n),d)        
+
+        if x_mask is not None:
+            img_hidden_states_t0 = img_hidden_states + gate_msa_t0 * img_attention_output  # (b,(t n),d)
+            img_hidden_states_mid = mask_select(img_hidden_states_mid, img_hidden_states_t0, x_mask, T=T, S=S)
+
+        text_hidden_states_mid = text_hidden_states + text_gate_msa * text_attention_output  # (b,n,d)
 
         # mlp (b,(t n),d)
-        img_mlp_input = layer.post_attention_layernorm(img_hidden_states)  # vision (b,(t n),d)
-        text_mlp_input = layer.post_attention_layernorm(text_hidden_states)  # language (b,n,d)
-        img_mlp_input = modulate(img_mlp_input, shift_mlp, scale_mlp)
-        text_mlp_input = modulate(text_mlp_input, text_shift_mlp, text_scale_mlp)
-        mlp_input = torch.cat((text_mlp_input, img_mlp_input), dim=1)  # (b,(n_t+t*n_i),d
+        img_mlp_input = layer.post_attention_layernorm(img_hidden_states_mid)  # vision (b,(t n),d)
+        text_mlp_input = layer.post_attention_layernorm(text_hidden_states_mid)  # language (b,n,d)
+        img_mlp_input_ = modulate(img_mlp_input, shift_mlp, scale_mlp)
+
+        if x_mask is not None:
+            img_mlp_input_t0 = modulate(img_mlp_input, shift_mlp_t0, scale_mlp_t0)
+            img_mlp_input_ = mask_select(img_mlp_input, img_mlp_input_t0, x_mask, T=T, S=S)
+
+        text_mlp_input_ = modulate(text_mlp_input, text_shift_mlp, text_scale_mlp)
+        mlp_input = torch.cat((text_mlp_input_, img_mlp_input_), dim=1)  # (b,(n_t+t*n_i),d
+
         mlp_output = layer.mlp(mlp_input, **kwargs)
         img_mlp_output = mlp_output[:, text_length:]  # vision (b,(t n),d)
         text_mlp_output = mlp_output[:, :text_length]  # language (b,n,d)
@@ -512,10 +568,15 @@ class AdaLNMixin(BaseMixin):
             text_mlp_output = layer.fourth_layernorm(text_mlp_output)
             img_mlp_output = layer.fourth_layernorm(img_mlp_output)
 
-        img_hidden_states = img_hidden_states + gate_mlp * img_mlp_output  # vision (b,(t n),d)
-        text_hidden_states = text_hidden_states + text_gate_mlp * text_mlp_output  # language (b,n,d)
+        img_hidden_states_ = img_hidden_states_mid + gate_mlp * img_mlp_output  # vision (b,(t n),d)
+        
+        if x_mask is not None:
+            img_hidden_states_t0 = img_hidden_states_mid + gate_mlp_t0 * img_mlp_output  # vision (b,(t n),d)
+            img_hidden_states_ = mask_select(img_hidden_states_, img_hidden_states_t0, x_mask, T=T, S=S)
 
-        hidden_states = torch.cat((text_hidden_states, img_hidden_states), dim=1)  # (b,(n_t+t*n_i),d)
+        text_hidden_states_ = text_hidden_states_mid + text_gate_mlp * text_mlp_output  # language (b,n,d)
+        hidden_states = torch.cat((text_hidden_states_, img_hidden_states_), dim=1)  # (b,(n_t+t*n_i),d)
+
         return hidden_states
 
     def reinit(self, parent_model=None):
@@ -758,14 +819,23 @@ class DiffusionTransformer(BaseModel):
             # assert y.shape[0] == x.shape[0]
             assert x.shape[0] % y.shape[0] == 0
             y = y.repeat_interleave(x.shape[0] // y.shape[0], dim=0)
-            emb = emb + self.label_emb(y)
+            class_emb = self.label_emb(y)
+            emb = emb + class_emb
 
+        x_mask = kwargs.get("x_mask", None)
+        if x_mask is not None:
+            t0 = torch.zeros_like(timesteps)
+            t0_emb = timestep_embedding(t0, self.model_channels, repeat_only=False, dtype=self.dtype)
+            emb_0 = self.time_embed(t0_emb)
+            if self.num_classes is not None:
+                emb_0 = emb_0 + class_emb
+            kwargs["emb_t0"] = emb_0
+        kwargs["latent_shape"] = (t, h//self.patch_size, w//self.patch_size)
         kwargs["seq_length"] = t * h * w // (self.patch_size**2)
         kwargs["images"] = x
         kwargs["emb"] = emb
         kwargs["encoder_outputs"] = context
         kwargs["text_length"] = context.shape[1]
-
         kwargs["input_ids"] = kwargs["position_ids"] = kwargs["attention_mask"] = torch.ones((1, 1)).to(x.dtype)
         output = super().forward(**kwargs)[0]
 
